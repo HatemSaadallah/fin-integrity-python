@@ -42,6 +42,52 @@ class TestClient(unittest.TestCase):
         fi.ledger.record(type="payment", reference="o", external_id="je_1", amount_minor=100, currency="usd")
         self.assertEqual(fi.inspect()[0]["side"], "ledger")
 
+    def test_fee_serializes_as_string_minor_dict(self):
+        fi = FinIntegrityClient(dry_run=True)
+        fi.processor.record(
+            type="payment", source="stripe", reference="order_1",
+            external_id="ch_1", amount_minor=4999, currency="USD",
+            fee_minor=175, fee_currency="USD",
+        )
+        env = fi.inspect()[0]
+        self.assertEqual(env["fee"], {"minor": "175", "currency": "usd"})
+
+    def test_trace_and_payout_ids_present_when_passed(self):
+        fi = FinIntegrityClient(dry_run=True)
+        fi.processor.record(
+            type="payment", source="stripe", reference="order_1",
+            external_id="ch_1", amount_minor=4999, currency="usd",
+            trace_id="trace_abc", payout_id="po_123",
+        )
+        env = fi.inspect()[0]
+        self.assertEqual(env["trace_id"], "trace_abc")
+        self.assertEqual(env["payout_id"], "po_123")
+
+    def test_trace_and_payout_ids_absent_when_not_passed(self):
+        fi = FinIntegrityClient(dry_run=True)
+        fi.processor.record(
+            type="payment", source="stripe", reference="order_1",
+            external_id="ch_1", amount_minor=4999, currency="usd",
+        )
+        env = fi.inspect()[0]
+        self.assertNotIn("fee", env)
+        self.assertNotIn("trace_id", env)
+        self.assertNotIn("payout_id", env)
+
+    def test_record_payout_envelope(self):
+        fi = FinIntegrityClient(dry_run=True)
+        fi.processor.record_payout(
+            external_id="po_123", amount_minor=100000, currency="USD",
+            trace_id="trace_xyz",
+        )
+        env = fi.inspect()[0]
+        self.assertEqual(env["event_type"], "payout")
+        self.assertEqual(env["side"], "processor")
+        self.assertEqual(env["reference"], "po_123")
+        self.assertEqual(env["external_id"], "po_123")
+        self.assertEqual(env["amount"], {"minor": "100000", "currency": "usd"})
+        self.assertEqual(env["trace_id"], "trace_xyz")
+
 
 if __name__ == "__main__":
     unittest.main()

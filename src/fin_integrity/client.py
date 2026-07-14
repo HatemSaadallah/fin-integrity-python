@@ -54,10 +54,35 @@ class _Side:
         direction: Optional[str] = None,
         exponent: Optional[int] = None,
         metadata: Optional[dict] = None,
+        fee_minor: Optional[int] = None,
+        fee_currency: Optional[str] = None,
+        trace_id: Optional[str] = None,
+        payout_id: Optional[str] = None,
     ) -> None:
         self._client._record(
             self._side, type, reference, external_id, amount_minor, currency,
             source, status, occurred_at, direction, exponent, metadata,
+            fee_minor, fee_currency, trace_id, payout_id,
+        )
+
+    def record_payout(
+        self,
+        *,
+        external_id: str,
+        amount_minor: int,
+        currency: str,
+        arrival_at: Any = None,
+        trace_id: Optional[str] = None,
+        occurred_at: Any = None,
+        source: Optional[str] = None,
+        status: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> None:
+        """Capture a processor payout (processor -> bank). Stored separately;
+        links to transactions via their payout_id."""
+        self._client._record_payout(
+            external_id, amount_minor, currency, arrival_at, trace_id,
+            occurred_at, source, status, metadata,
         )
 
 
@@ -118,10 +143,13 @@ class FinIntegrityClient:
             kwargs["amount_minor"], kwargs["currency"], kwargs.get("source"),
             kwargs.get("status"), kwargs.get("occurred_at"), kwargs.get("direction"),
             kwargs.get("exponent"), kwargs.get("metadata"),
+            kwargs.get("fee_minor"), kwargs.get("fee_currency"),
+            kwargs.get("trace_id"), kwargs.get("payout_id"),
         )
 
     def _record(self, side, type, reference, external_id, amount_minor, currency,
-                source, status, occurred_at, direction, exponent, metadata) -> None:
+                source, status, occurred_at, direction, exponent, metadata,
+                fee_minor=None, fee_currency=None, trace_id=None, payout_id=None) -> None:
         try:
             if int(amount_minor) != amount_minor:
                 raise ValueError("amount_minor must be an integer in minor units")
@@ -140,10 +168,47 @@ class FinIntegrityClient:
             }
             if exponent is not None:
                 env["amount"]["exponent"] = exponent
+            if fee_minor is not None:
+                env["fee"] = {"minor": str(int(fee_minor)), "currency": (fee_currency or currency).lower()}
+            if trace_id is not None:
+                env["trace_id"] = trace_id
+            if payout_id is not None:
+                env["payout_id"] = payout_id
             if status is not None:
                 env["status"] = status
             if direction is not None:
                 env["direction"] = direction
+            if metadata is not None:
+                env["metadata"] = metadata
+            env["idempotency_key"] = self._idem(env)
+            self._enqueue(env)
+        except Exception as e:  # fail-open — never raise into the caller
+            self.on_error(e)
+
+    def _record_payout(self, external_id, amount_minor, currency, arrival_at,
+                       trace_id, occurred_at, source, status, metadata) -> None:
+        try:
+            if int(amount_minor) != amount_minor:
+                raise ValueError("amount_minor must be an integer in minor units")
+            env = {
+                "schema_version": "1.0",
+                "event_id": "fi_" + uuid.uuid4().hex,
+                "idempotency_key": "",
+                "side": "processor",
+                "source": source or "custom",
+                "event_type": "payout",
+                "reference": external_id,
+                "external_id": external_id,
+                "amount": {"minor": str(int(amount_minor)), "currency": currency.lower()},
+                "occurred_at": _to_iso(occurred_at),
+                "captured_at": _now_iso(),
+            }
+            if trace_id is not None:
+                env["trace_id"] = trace_id
+            if arrival_at is not None:
+                env["arrival_at"] = _to_iso(arrival_at)
+            if status is not None:
+                env["status"] = status
             if metadata is not None:
                 env["metadata"] = metadata
             env["idempotency_key"] = self._idem(env)
