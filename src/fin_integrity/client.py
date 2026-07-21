@@ -83,6 +83,19 @@ def _to_iso(v: Any) -> str:
     return str(v)
 
 
+def _clean_environment(raw: Any) -> Optional[str]:
+    """Sentry-style environment validation, kept in sync with the Node SDK and
+    the ingest server: trimmed; <=64 chars; no whitespace or forward slash; not
+    "none" (case-insensitive). Returns None if absent/invalid — the caller falls
+    back to its default, and ultimately the server defaults to "production"."""
+    if not isinstance(raw, str):
+        return None
+    v = raw.strip()
+    if not v or len(v) > 64 or any(c.isspace() or c == "/" for c in v) or v.lower() == "none":
+        return None
+    return v
+
+
 class _Side:
     """Namespace exposing .record() for one side (processor / ledger)."""
 
@@ -110,6 +123,7 @@ class _Side:
         payout_id: Optional[str] = None,
         subscription_id: Optional[str] = None,
         parent_external_id: Optional[str] = None,
+        environment: Optional[str] = None,
     ) -> None:
         """Capture money movement.
 
@@ -125,7 +139,7 @@ class _Side:
             self._side, type, reference, external_id, amount_minor, currency,
             source, status, occurred_at, direction, exponent, metadata,
             fee_minor, fee_currency, trace_id, payout_id,
-            subscription_id, parent_external_id,
+            subscription_id, parent_external_id, environment,
         )
 
     def record_payout(
@@ -140,12 +154,13 @@ class _Side:
         source: Optional[str] = None,
         status: Optional[str] = None,
         metadata: Optional[dict] = None,
+        environment: Optional[str] = None,
     ) -> None:
         """Capture a processor payout (processor -> bank). Stored separately;
         links to transactions via their payout_id."""
         self._client._record_payout(
             external_id, amount_minor, currency, arrival_at, trace_id,
-            occurred_at, source, status, metadata,
+            occurred_at, source, status, metadata, environment,
         )
 
     def record_subscription(
@@ -162,6 +177,7 @@ class _Side:
         occurred_at: Any = None,
         source: Optional[str] = None,
         metadata: Optional[dict] = None,
+        environment: Optional[str] = None,
     ) -> None:
         """Capture a recurring billing container. Not money movement — this is
         what a charge is expected to arrive in, which is what lets
@@ -175,7 +191,7 @@ class _Side:
         self._client._record_subscription(
             external_id, amount_minor, currency, status, interval,
             current_period_start, current_period_end, trace_id, occurred_at,
-            source, metadata,
+            source, metadata, environment,
         )
 
 
@@ -206,7 +222,11 @@ class FinIntegrityClient:
                 "Use dry_run=True to test without a key."
             )
         self.endpoint = (endpoint or os.environ.get("FIN_INTEGRITY_ENDPOINT") or DEFAULT_ENDPOINT).rstrip("/")
-        self.environment = environment or os.environ.get("PYTHON_ENV") or "production"
+        # Mirrors the Node SDK: an explicit environment, else PYTHON_ENV, else
+        # unset (omitted from events) so the server applies its "production"
+        # default. Not hardcoded to "production" here — that would put a value in
+        # the idempotency basis that the Node SDK omits, breaking cross-SDK dedup.
+        self.environment = _clean_environment(environment or os.environ.get("PYTHON_ENV"))
         self.idempotency = idempotency
         self.batch_max_size = batch_max_size
         self.flush_interval = flush_interval
@@ -239,12 +259,19 @@ class FinIntegrityClient:
             kwargs.get("fee_minor"), kwargs.get("fee_currency"),
             kwargs.get("trace_id"), kwargs.get("payout_id"),
             kwargs.get("subscription_id"), kwargs.get("parent_external_id"),
+            kwargs.get("environment"),
         )
+
+    def _env_for(self, per_event: Any) -> Optional[str]:
+        """Per-event override wins over the client default; an invalid value
+        falls back to the default (server defaults to production if that's absent
+        too)."""
+        return _clean_environment(per_event) or self.environment
 
     def _record(self, side, type, reference, external_id, amount_minor, currency,
                 source, status, occurred_at, direction, exponent, metadata,
                 fee_minor=None, fee_currency=None, trace_id=None, payout_id=None,
-                subscription_id=None, parent_external_id=None) -> None:
+                subscription_id=None, parent_external_id=None, environment=None) -> None:
         try:
             if int(amount_minor) != amount_minor:
                 raise ValueError("amount_minor must be an integer in minor units")
@@ -277,6 +304,9 @@ class FinIntegrityClient:
                 env["status"] = status
             if direction is not None:
                 env["direction"] = direction
+            resolved_env = self._env_for(environment)
+            if resolved_env is not None:
+                env["environment"] = resolved_env
             if metadata is not None:
                 env["metadata"] = metadata
             env["idempotency_key"] = self._idem(env)
@@ -286,7 +316,7 @@ class FinIntegrityClient:
 
     def _record_subscription(self, external_id, amount_minor, currency, status,
                              interval, current_period_start, current_period_end,
-                             trace_id, occurred_at, source, metadata) -> None:
+                             trace_id, occurred_at, source, metadata, environment=None) -> None:
         try:
             if int(amount_minor) != amount_minor:
                 raise ValueError("amount_minor must be an integer in minor units")
@@ -312,6 +342,9 @@ class FinIntegrityClient:
                 env["current_period_end"] = _to_iso(current_period_end)
             if trace_id is not None:
                 env["trace_id"] = trace_id
+            resolved_env = self._env_for(environment)
+            if resolved_env is not None:
+                env["environment"] = resolved_env
             if metadata is not None:
                 env["metadata"] = metadata
             env["idempotency_key"] = self._idem(env)
@@ -320,7 +353,7 @@ class FinIntegrityClient:
             self.on_error(e)
 
     def _record_payout(self, external_id, amount_minor, currency, arrival_at,
-                       trace_id, occurred_at, source, status, metadata) -> None:
+                       trace_id, occurred_at, source, status, metadata, environment=None) -> None:
         try:
             if int(amount_minor) != amount_minor:
                 raise ValueError("amount_minor must be an integer in minor units")
@@ -343,6 +376,9 @@ class FinIntegrityClient:
                 env["arrival_at"] = _to_iso(arrival_at)
             if status is not None:
                 env["status"] = status
+            resolved_env = self._env_for(environment)
+            if resolved_env is not None:
+                env["environment"] = resolved_env
             if metadata is not None:
                 env["metadata"] = metadata
             env["idempotency_key"] = self._idem(env)
@@ -373,6 +409,9 @@ class FinIntegrityClient:
             env["side"],
             env["external_id"],
             env["event_type"],
+            # Environment is part of identity: the same external_id in staging vs
+            # production are distinct facts that must not collapse to one row.
+            env.get("environment") or "",
             # Mutable state. Absent fields collapse to "" so unused ones cost nothing.
             env.get("status") or "",
             (env.get("amount") or {}).get("minor") or "",

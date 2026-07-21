@@ -292,8 +292,8 @@ class TestClient(unittest.TestCase):
         )
         sub, dispute = fi.inspect()
         self.assertEqual(sub["current_period_end"], "2026-08-01T00:00:00.000Z")
-        self.assertEqual(sub["idempotency_key"], "fi_0d40fce657d7774ac47f5243626585f5310c44a4")
-        self.assertEqual(dispute["idempotency_key"], "fi_2acd934e42c9c65987df0ad9a99e9850fbdc31a2")
+        self.assertEqual(sub["idempotency_key"], "fi_66cb1de5fd6623000ac3ed26197e326bca0b8cfb")
+        self.assertEqual(dispute["idempotency_key"], "fi_5af5c2ffec77961cb98794189e53b1bf761a95d6")
 
     def test_iso_matches_js_millisecond_precision(self):
         fi = FinIntegrityClient(dry_run=True)
@@ -304,6 +304,44 @@ class TestClient(unittest.TestCase):
         # JS Date.toISOString() truncates to 3 fractional digits; Python's
         # isoformat() would emit 6 here and none at zero microseconds.
         self.assertEqual(fi.inspect()[0]["arrival_at"], "2026-08-03T12:30:45.123Z")
+
+    # ---- environment (Sentry-style, per-event) ----------------------------
+    def test_environment_default_from_config(self):
+        fi = FinIntegrityClient(dry_run=True, environment="staging")
+        fi.processor.record(type="payment", reference="o1", external_id="ch_1",
+                            amount_minor=100, currency="usd")
+        self.assertEqual(fi.inspect()[0]["environment"], "staging")
+
+    def test_environment_per_event_override_beats_default(self):
+        fi = FinIntegrityClient(dry_run=True, environment="staging")
+        fi.processor.record(type="payment", reference="o1", external_id="ch_1",
+                            amount_minor=100, currency="usd", environment="production")
+        self.assertEqual(fi.inspect()[0]["environment"], "production")
+
+    def test_environment_invalid_override_falls_back_to_default(self):
+        fi = FinIntegrityClient(dry_run=True, environment="staging")
+        fi.processor.record(type="payment", reference="o1", external_id="ch_1",
+                            amount_minor=100, currency="usd", environment="bad env")
+        self.assertEqual(fi.inspect()[0]["environment"], "staging")
+
+    def test_environment_omitted_when_unset(self):
+        with mock.patch.dict("os.environ", {}, clear=False):
+            import os as _os
+            _os.environ.pop("PYTHON_ENV", None)
+            fi = FinIntegrityClient(dry_run=True)
+            fi.processor.record(type="payment", reference="o1", external_id="ch_1",
+                                amount_minor=100, currency="usd")
+            self.assertNotIn("environment", fi.inspect()[0])
+
+    def test_environment_is_in_the_idempotency_key(self):
+        fi = FinIntegrityClient(dry_run=True)
+        base = dict(type="payment", reference="o1", external_id="ch_1",
+                    amount_minor=100, currency="usd", status="succeeded")
+        fi.processor.record(**base, environment="staging")
+        fi.processor.record(**base, environment="production")
+        a, b = fi.inspect()
+        # Same fact, two environments -> two rows, not one collapsed.
+        self.assertNotEqual(a["idempotency_key"], b["idempotency_key"])
 
     # ---- transport: a 200 is not proof every event stored -----------------
     def test_rejection_inside_a_200_surfaces_an_error(self):
